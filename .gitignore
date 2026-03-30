@@ -1,0 +1,31 @@
+# RPM build artifacts
+*.rpm
+*.src.rpm
+*.tar.gz
+
+# Build directories
+rpmbuild/
+BUILD/
+RPMS/
+SOURCES/
+SPECS/
+SRPMS/
+
+# COPR config (contains secrets)
+.copr
+copr
+
+# Editor files
+*~
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.pyc
+venv/
+
+# MacOS
+.DS_Store

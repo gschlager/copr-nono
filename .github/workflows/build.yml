@@ -1,0 +1,159 @@
+name: Monitor nono and Build on COPR
+
+on:
+  schedule:
+    # Run daily at 9:00 UTC
+    - cron: '0 9 * * *'
+  workflow_dispatch:
+    inputs:
+      force_version:
+        description: 'Force build specific version (e.g., v0.4.0)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPO: always-further/nono
+  COPR_PROJECT: ${{ secrets.COPR_USERNAME }}/nono
+
+jobs:
+  check-release:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      version: ${{ steps.check.outputs.version }}
+      version_number: ${{ steps.check.outputs.version_number }}
+    steps:
+      - name: Check for new release
+        id: check
+        env:
+          FORCE_VERSION: ${{ github.event.inputs.force_version }}
+          COPR_USERNAME: ${{ secrets.COPR_USERNAME }}
+        run: |
+          # Get latest release from GitHub API
+          LATEST=$(curl --fail -s "https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/releases/latest" | jq -r .tag_name) || {
+            echo "Failed to fetch latest release from GitHub API"
+            echo "should_build=false" >> $GITHUB_OUTPUT
+            exit 0
+          }
+
+          if [ -n "$FORCE_VERSION" ]; then
+            LATEST="$FORCE_VERSION"
+            echo "Force building version: $LATEST"
+          fi
+
+          echo "Latest upstream version: $LATEST"
+
+          # Get last built version from COPR
+          COPR_LATEST=$(curl --fail -s "https://copr.fedorainfracloud.org/api_3/package?ownername=${COPR_USERNAME}&projectname=nono&packagename=nono&with_latest_build=True" | jq -r '.builds.latest.source_package.version' || echo "")
+
+          echo "Last COPR build: $COPR_LATEST"
+
+          # Remove 'v' prefix for comparison
+          LATEST_NUM=${LATEST#v}
+
+          if [ "$LATEST" != "null" ] && [ "$LATEST" != "" ]; then
+            if [ "$LATEST_NUM" != "$COPR_LATEST" ] || [ -n "$FORCE_VERSION" ]; then
+              echo "New version detected: $LATEST"
+              echo "should_build=true" >> $GITHUB_OUTPUT
+              echo "version=$LATEST" >> $GITHUB_OUTPUT
+              echo "version_number=$LATEST_NUM" >> $GITHUB_OUTPUT
+            else
+              echo "No new version. Latest ($LATEST_NUM) already built."
+              echo "should_build=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "Failed to fetch latest release"
+            echo "should_build=false" >> $GITHUB_OUTPUT
+          fi
+
+  build-rpm:
+    needs: check-release
+    if: needs.check-release.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      - name: Checkout packaging repo
+        uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: dnf install -y rpm-build rpmlint copr-cli curl
+
+      - name: Configure COPR
+        env:
+          COPR_LOGIN: ${{ secrets.COPR_LOGIN }}
+          COPR_USERNAME: ${{ secrets.COPR_USERNAME }}
+          COPR_TOKEN: ${{ secrets.COPR_TOKEN }}
+        run: |
+          mkdir -p ~/.config
+          printf '[copr-cli]\nlogin = %s\nusername = %s\ntoken = %s\ncopr_url = https://copr.fedorainfracloud.org\n' \
+            "$COPR_LOGIN" "$COPR_USERNAME" "$COPR_TOKEN" > ~/.config/copr
+          chmod 600 ~/.config/copr
+
+      - name: Debug COPR config
+        run: |
+          echo "Lines: $(wc -l < ~/.config/copr)"
+          echo "First line: $(head -1 ~/.config/copr)"
+          echo "Fields found: $(grep -c '=' ~/.config/copr)"
+          cat -A ~/.config/copr | sed 's/=.*/=***/'
+
+      - name: Setup RPM build tree
+        run: |
+          mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+
+      - name: Update spec file version
+        env:
+          VERSION: ${{ needs.check-release.outputs.version_number }}
+        run: |
+          sed -i "s/^Version:.*/Version:        $VERSION/" nono.spec
+          cp nono.spec ~/rpmbuild/SPECS/
+
+      - name: Download source tarball
+        env:
+          VERSION: ${{ needs.check-release.outputs.version }}
+        run: |
+          cd ~/rpmbuild/SOURCES
+          curl --fail -L -o "${VERSION}.tar.gz" "https://github.com/${{ env.UPSTREAM_REPO }}/archive/refs/tags/${VERSION}.tar.gz"
+
+      - name: Build SRPM
+        run: |
+          cd ~/rpmbuild/SPECS
+          rpmbuild -bs nono.spec
+
+          SRPM=$(ls -t ~/rpmbuild/SRPMS/nono-*.src.rpm | head -1)
+          echo "SRPM_PATH=$SRPM" >> $GITHUB_ENV
+          echo "Built SRPM: $SRPM"
+
+      - name: Upload to COPR
+        run: |
+          copr-cli build ${{ env.COPR_PROJECT }} "$SRPM_PATH" --nowait
+          echo "Build submitted to COPR: https://copr.fedorainfracloud.org/coprs/${{ env.COPR_PROJECT }}/builds/"
+
+      - name: Commit updated spec file
+        if: github.event.inputs.force_version == ''
+        env:
+          VERSION: ${{ needs.check-release.outputs.version_number }}
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+          git add nono.spec
+          git commit -m "Update to version $VERSION" || echo "No changes to commit"
+          git push || echo "Nothing to push"
+
+      - name: Create GitHub release
+        if: github.event.inputs.force_version == ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: 'fedora-${{ needs.check-release.outputs.version }}',
+              name: 'Fedora package for ${{ needs.check-release.outputs.version }}',
+              body: 'RPM package built for nono ${{ needs.check-release.outputs.version }}\n\nInstall with:\n```bash\nsudo dnf copr enable ${{ secrets.COPR_USERNAME }}/nono\nsudo dnf install nono\n```\n\nCOPR builds: https://copr.fedorainfracloud.org/coprs/${{ env.COPR_PROJECT }}/builds/',
+              draft: false,
+              prerelease: false
+            });
